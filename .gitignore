@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行产物与日志
+_out/
+paofen.log
+paofen_config.json
+
+# 调试产物
+_diag/
+
+# 公司数据样例（模板与考核明细照片，勿上传公开仓库）
+参考文件/
+
+# 系统 / IDE
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

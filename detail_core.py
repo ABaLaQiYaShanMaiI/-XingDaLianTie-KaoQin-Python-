@@ -1,0 +1,330 @@
+# -*- coding: utf-8 -*-
+"""
+detail_core.py - 《考核明细》照片 OCR 解析
+
+输入: 手机拍摄的《X月X班考核明细》单据照片(参考 参考文件/考核明细图片.jpg)
+输出: 结构化考核条目, 供 excel_core.fill_from_details 填写《煤库作业区跑分绩效汇总》
+
+单据约定(与现场手写单一致):
+  * 标题行: 「7月甲班考核明细」 -> 月份=7, 班次=甲
+  * 条目行: 「7.10李新明两穿一带不规范-5」 -> 日期=7.10, 姓名, 事由, 分值=-5
+  * 分值兼容: +3 / 3 / -3 / 3分; 日期兼容: 7.10 / 7月10日 / 22(无月份,取标题月)
+  * 姓名与模板名单模糊匹配(处理 OCR 误差), 匹配不上保留原名并给出警告
+
+实现要点:
+  * 逐个 OCR 文本框解析(不按整行拼接), 避免左边"序号"数字(10/12/...)混入条目;
+  * 自动识别拍照方向(0/90/180/270), 原方向能识别出标题+条目时不再旋转;
+  * RapidOCR 引擎惰性加载(首次识别才初始化, GUI 启动不卡)。
+"""
+import logging
+import os
+import re
+from difflib import SequenceMatcher
+
+import cv2
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+TITLE_KEY = '考核明细'
+SHIFTS = ('甲', '乙', '丙', '丁')
+SHIFT_NAMES = tuple(s + '班' for s in SHIFTS)
+
+# 标题: 「7月甲班考核明细」(兼容空格/年月混杂)
+TITLE_RE = re.compile(r'(?P<month>\d{1,2})\s*月.*?(?P<shift>[甲乙丙丁])\s*班')
+# 条目日期: 「7.10」/「7月10」/「22」(无月份), 后接其余文本
+DATE_RE = re.compile(
+    r'^(?:(?P<month>\d{1,2})[.．,，、月](?P<day>\d{1,2})|(?P<day_only>\d{1,2}))[日号]?(?P<rest>.*)$')
+# 姓名槽: 紧跟日期的 2~4 个汉字(可能吞入事由首字, 由 match_name 前缀收敛)
+NAME_RE = re.compile(r'^[\u4e00-\u9fa5]{2,4}')
+# 行尾分值: 「+3」/「-5」/「3」/「3分」
+SCORE_RE = re.compile(r'(?P<sign>[+\-]?)\s*(?P<num>\d+(?:\.\d+)?)\s*分?$')
+
+# 全角/标点归一化
+_NORMAL_TABLE = str.maketrans({
+    '　': '', ' ': '', '．': '.', '，': '', '。': '', '、': '',
+    '＋': '+', '－': '-', '—': '-', '–': '-', '～': '', '·': '',
+})
+
+_ENGINE = None
+
+
+def get_engine():
+    """惰性加载 RapidOCR 引擎(进程内单例)。"""
+    global _ENGINE
+    if _ENGINE is None:
+        from rapidocr_onnxruntime import RapidOCR
+        logger.info('初始化 RapidOCR 引擎...')
+        _ENGINE = RapidOCR()
+    return _ENGINE
+
+
+def imread_cn(path):
+    """支持中文路径读图(粗校验文件存在)。"""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f'找不到照片: {path}')
+    data = np.fromfile(path, dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f'图片无法解码: {path}')
+    return img
+
+
+def _rot(img, k):
+    """k 为 90 的倍数(0/90/180/270), 顺时针旋转。"""
+    k = int(k) % 360
+    if k == 0:
+        return img
+    return np.ascontiguousarray(np.rot90(img, k=-k // 90))
+
+
+def normalize(text):
+    """OCR 文本归一化: 去空白、全角转半角。"""
+    return str(text).translate(_NORMAL_TABLE)
+
+
+
+def match_name(slot, roster):
+    """把 OCR 得到的姓名槽匹配到模板名单。
+
+    返回 (matched_name 或 None, 相似度)。策略:
+      1) 前缀收敛精确匹配: 槽位按 4->2 字截短, 命中名单即成功(处理吞字, 如
+         「田忠山两穿一带」-> 槽位「田忠山两」-> 截短为「田忠山」);
+      2) difflib 模糊匹配(阈值 0.45, 处理 OCR 形近字, 如 曹启太/曹启大)。
+    """
+    if not slot or not roster:
+        return None, 0.0
+    candidates = {slot[:k] for k in range(min(len(slot), 4), 1, -1)}
+    for cand in candidates:
+        if cand in roster:
+            return cand, 1.0
+    best, best_ratio = None, 0.0
+    for cand in roster:
+        for part in candidates:
+            ratio = SequenceMatcher(None, part, cand).ratio()
+            if ratio > best_ratio:
+                best, best_ratio = cand, ratio
+    if best_ratio >= 0.45:
+        return best, best_ratio
+    return None, best_ratio
+
+
+def _apply_roster(entry, roster):
+    """用班次名单对 entry 做姓名匹配, 并回收姓名槽吞掉的事由首字(幂等)。"""
+    slot = entry.get('name_raw') or ''
+    matched, sim = match_name(slot, roster)
+    if matched and slot.startswith(matched) and len(slot) > len(matched):
+        entry['reason'] = slot[len(matched):] + (entry.get('reason') or '')
+        entry['name_raw'] = matched
+    entry['name'] = matched
+    entry['name_sim'] = round(float(sim), 2)
+    return entry
+
+
+def parse_entry(text, roster):
+    """解析单条考核明细文本 -> dict; 不是条目返回 None。
+
+    dict 字段: month/day/name_raw/name/name_sim/reason/delta
+    """
+    t = normalize(text)
+    if not t or TITLE_KEY in t:
+        return None
+    m = DATE_RE.match(t)
+    if not m:
+        return None
+    if m.group('month') is not None:
+        month, day = int(m.group('month')), int(m.group('day'))
+    else:
+        month, day = None, int(m.group('day_only'))
+    rest = m.group('rest') or ''
+    nm = NAME_RE.match(rest)
+    if not nm:
+        return None
+    slot = nm.group(0)
+    tail = rest[nm.end():]
+    sm = SCORE_RE.search(tail)
+    if not sm:
+        return None
+    delta = float(sm.group('num'))
+    if sm.group('sign') == '-':
+        delta = -delta
+    entry = {
+        'month': month,
+        'day': day,
+        'name_raw': slot,
+        'name': None,
+        'name_sim': 0.0,
+        'reason': tail[:sm.start()],
+        'delta': int(delta) if float(delta).is_integer() else delta,
+    }
+    return _apply_roster(entry, roster)
+
+
+def _entry_key(e):
+    return (e.get('day'), e.get('name_raw'), e.get('delta'))
+
+
+
+def _parse_orientation(engine, img, roster):
+    """对给定方向的图像做 OCR 并解析, 返回结果 dict。"""
+    result, _ = engine(img)
+    items = []
+    for box, text, score in (result or []):
+        ys = [float(p[1]) for p in box]
+        xs = [float(p[0]) for p in box]
+        items.append({
+            'text': str(text),
+            'conf': float(score),
+            'yc': sum(ys) / 4.0,
+            'xc': sum(xs) / 4.0,
+            'h': max(ys) - min(ys),
+        })
+    # 标题(取置信度最高的命中)
+    month = shift = None
+    best_title = None
+    for it in items:
+        t = normalize(it['text'])
+        if TITLE_KEY in t:
+            m = TITLE_RE.search(t)
+            if m and (best_title is None or it['conf'] > best_title[0]):
+                best_title = (it['conf'], int(m.group('month')), m.group('shift'))
+    if best_title:
+        month, shift = best_title[1], best_title[2] + '班'
+    # 条目: 逐个 OCR 框解析(序号等噪声框不符合条目格式, 自然过滤)
+    entries, used_ids = [], set()
+    med_h = float(np.median([it['h'] for it in items])) if items else 30.0
+    tol = max(14.0, med_h * 0.6)
+    for idx, it in enumerate(items):
+        e = parse_entry(it['text'], roster)
+        if e is None:
+            continue
+        e['conf'] = round(it['conf'], 2)
+        e['_yc'] = it['yc']
+        used_ids.add(idx)
+        entries.append(e)
+    # 兜底: 未解析的碎片按 y 聚成行、按 x 拼接后再试(处理 OCR 拆框)
+    left = [it for i, it in enumerate(items) if i not in used_ids]
+    left.sort(key=lambda it: it['yc'])
+    rows = []
+    for it in left:
+        if rows and abs(it['yc'] - rows[-1][-1]['yc']) <= tol:
+            rows[-1].append(it)
+        else:
+            rows.append([it])
+    for row in rows:
+        if any(abs(row[0]['yc'] - e['_yc']) <= tol for e in entries):
+            continue  # 该行主体已按整框解析过
+        row.sort(key=lambda it: it['xc'])
+        joined = ''.join(it['text'] for it in row)
+        e = parse_entry(joined, roster)
+        if e is not None:
+            e['conf'] = round(min(it['conf'] for it in row), 2)
+            e['_yc'] = sum(it['yc'] for it in row) / len(row)
+            entries.append(e)
+    # 去重(同行同键)并按版面顺序排序
+    uniq = []
+    for e in sorted(entries, key=lambda x: x['_yc']):
+        dup = any(abs(e['_yc'] - u['_yc']) <= tol and _entry_key(e) == _entry_key(u)
+                  for u in uniq)
+        if not dup:
+            uniq.append(e)
+    for e in uniq:
+        e.pop('_yc', None)
+    return {'month': month, 'shift': shift, 'entries': uniq, 'items': items}
+
+
+def _score_orientation(res):
+    return (len(res['entries']), sum(e['conf'] for e in res['entries']))
+
+
+
+def parse_photo(path, rosters, shift_override=None):
+    """识别一张考核明细照片。
+
+    rosters: {班次表名: [姓名,...]}(excel_core.load_rosters 的返回值)
+    shift_override: 用户在界面指定的班次(如 '甲班'); None=按标题自动识别
+    返回: {'path', 'month', 'shift', 'entries', 'warnings', 'rotate', 'raw_count'}
+    """
+    warnings = []
+    img = imread_cn(path)
+    engine = get_engine()
+    best = None
+    for k in (0, 90, 180, 270):
+        res = _parse_orientation(engine, _rot(img, k), ())
+        res['rotate'] = k
+        if best is None or _score_orientation(res) > _score_orientation(best):
+            best = res
+        if res['month'] is not None and res['shift'] is not None \
+                and len(res['entries']) > 0:
+            break  # 标题+条目齐全, 不必再旋转
+        if k == 0 and len(res['entries']) == 0:
+            warnings.append('原方向未解析到条目, 已自动尝试旋转识别')
+    res = best
+    if res['month'] is None:
+        warnings.append('未识别到标题「X月X班考核明细」, 请在界面核对/指定班次与月份')
+    if not res['entries']:
+        warnings.append('未解析到任何考核条目, 请确认照片内容与清晰度')
+    # 用最终确定的班次名单匹配姓名
+    shift = shift_override or res['shift']
+    roster = tuple(rosters.get(shift or '', ()))
+    if shift and not roster:
+        warnings.append(f'模板中不存在班次「{shift}」的名单, 姓名未能匹配')
+    for e in res['entries']:
+        _apply_roster(e, roster)
+        if e['month'] is not None and res['month'] is not None \
+                and e['month'] != res['month']:
+            warnings.append(
+                f"条目 {e['month']}.{e['day']} 月份与标题({res['month']}月)不一致, 请核对")
+        if not (1 <= e['day'] <= 31):
+            warnings.append(f"条目日期 {e['day']} 超出 1~31, 请人工核对")
+        if e['name'] is None:
+            warnings.append(f"姓名「{e['name_raw']}」未匹配到{shift or '模板'}名单"
+                            f'(相似度 {e["name_sim"]}), 将只写入明细存档不记分')
+    return {
+        'path': path,
+        'month': res['month'],
+        'shift': shift,
+        'entries': res['entries'],
+        'warnings': warnings,
+        'rotate': res['rotate'],
+        'raw_count': len(res['items']),
+    }
+
+
+def merge_results(results, default_month=None):
+    """合并多张照片的解析结果 -> {'month', 'shift_entries', 'warnings'}。"""
+    warnings = []
+    month = None
+    for r in results:
+        if r['month'] is not None:
+            if month is None:
+                month = r['month']
+            elif month != r['month']:
+                warnings.append(
+                    f"照片「{os.path.basename(r['path'])}」月份({r['month']}月)"
+                    f'与先前({month}月)不一致, 以{month}月为准')
+    if month is None:
+        month = default_month
+    shift_entries = {}
+    for r in results:
+        shift = r['shift']
+        if not shift:
+            warnings.append(
+                f"照片「{os.path.basename(r['path'])}」班次未知, 未纳入生成"
+                f'(请为其指定班次后重新识别)')
+            continue
+        shift_entries.setdefault(shift, []).extend(r['entries'])
+        for w in r['warnings']:
+            warnings.append(f"[{os.path.basename(r['path'])}] {w}")
+    return {'month': month, 'shift_entries': shift_entries, 'warnings': warnings}
+
+
+def detail_text(entry, month=None):
+    """还原成存档用的一条明细文本, 如「7.10李新明两穿一带不规范-5」。"""
+    m = entry.get('month') or month
+    name = entry.get('name_raw') or entry.get('name') or ''
+    d = entry['delta']
+    if float(d).is_integer():
+        d = int(d)
+    score = ('+' if d >= 0 else '') + str(d)
+    return f'{m}.{entry["day"]}{name}{entry.get("reason") or ""}{score}'

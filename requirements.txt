@@ -1,0 +1,7 @@
+# -*- coding: utf-8 -*-
+# 跑分绩效汇总自动生成工具 依赖(与当前开发环境一致)
+openpyxl==3.1.5
+rapidocr-onnxruntime==1.2.3
+opencv-python==5.0.0.93
+numpy==2.5.1
+tkinterdnd2==0.6.2
