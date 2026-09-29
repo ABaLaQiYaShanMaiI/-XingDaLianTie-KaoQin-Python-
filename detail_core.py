@@ -113,10 +113,66 @@ def match_name(slot, roster):
     return None, best_ratio
 
 
+# 复姓(4 字名多为「复姓+名」, 退回事由首字时要放过)
+COMPOUND_SURNAMES = (
+    '欧阳', '太史', '端木', '上官', '司马', '东方', '独孤', '南宫', '万俟', '闻人',
+    '夏侯', '诸葛', '尉迟', '公羊', '赫连', '澹台', '皇甫', '宗政', '濮阳', '公冶',
+    '太叔', '申屠', '公孙', '慕容', '仲孙', '钟离', '长孙', '宇文', '司徒', '鲜于',
+    '司空', '闾丘', '子车', '亓官', '司寇', '巫马', '公西', '颛孙', '壤驷', '公良',
+    '漆雕', '乐正', '宰父', '谷梁', '拓跋', '夹谷', '轩辕', '令狐', '段干', '百里',
+    '呼延', '东郭', '南门', '羊舌', '微生', '梁丘', '左丘', '西门', '第五', '公乘',
+    '南荣', '东里', '仲长', '即墨', '达奚', '褚师',
+)
+
+# 事由常见开头词: 用来判断「姓名槽的最后 1~2 个字其实属于事由」
+REASON_WORDS = (
+    '接班', '交班', '上班', '下班', '班前', '班中', '两穿', '一带', '三穿', '两穿一带',
+    '发现', '未', '不', '迟到', '早退', '更衣', '清扫', '清理', '疏通', '更换', '安排',
+    '岗位', '设备', '安全', '隐患', '记录', '规范', '违规', '漏', '点名', '交接', '卫生',
+    '现场', '临时', '主动', '完成', '检查', '点检', '工作', '作业', '区域', '人员', '管理',
+    '请假', '离岗', '串岗', '睡岗', '玩手机', '吸烟', '着装', '劳保', '标识', '整改', '考核',
+)
+
+
+def _trim_name_slot(entry):
+    """判断姓名槽是否吞了事由首字, 是则退回(最多退 2 个字)。返回是否退过。
+
+    保守策略: 只有「退回后事由以常见事由词开头」且「不是复姓」才退, 避免误切 4 字姓名。
+    """
+    slot = entry.get('name_raw') or ''
+    reason = entry.get('reason') or ''
+    if len(slot) <= 2:
+        return False
+    for k in (1, 2):
+        if len(slot) - k < 2:
+            break
+        name = slot[:len(slot) - k]
+        extra = slot[len(slot) - k:]
+        if name[:2] in COMPOUND_SURNAMES:
+            break                        # 复姓: 不做进退
+        merged = extra + reason
+        if any(merged.startswith(w) for w in REASON_WORDS):
+            entry['name_raw'] = name
+            entry['reason'] = merged
+            entry['slot_trimmed'] = extra
+            return True
+    return False
+
+
 def _apply_roster(entry, roster):
-    """用班次名单对 entry 做姓名匹配, 并回收姓名槽吞掉的事由首字(幂等)。"""
+    """用班次名单对 entry 做姓名匹配, 并回收姓名槽吞掉的事由首字(幂等)。
+
+    姓名槽是按「日期后紧跟的 2~4 个汉字」取的, 难免吞进事由首字
+    (「陈金荣接」+「班发现卫生未做」)。处理顺序:
+      1) 先按原槽匹配名单 —— 名单里真有 4 字名(复姓)或 3 字名都能命中;
+      2) 匹配不上时判断是否吞了事由首字(见 _trim_name_slot), 退回后再匹配一次;
+      3) 命中则把槽里多出来的字并回事由。
+    """
     slot = entry.get('name_raw') or ''
     matched, sim = match_name(slot, roster)
+    if not matched and _trim_name_slot(entry):
+        slot = entry['name_raw']
+        matched, sim = match_name(slot, roster)
     if matched and slot.startswith(matched) and len(slot) > len(matched):
         entry['reason'] = slot[len(matched):] + (entry.get('reason') or '')
         entry['name_raw'] = matched
@@ -305,8 +361,14 @@ def parse_photo(path, rosters, shift_override=None):
             warnings.append(f"分值「{e.get('score_raw')}」符号在数字右侧(识别倒序), "
                             f"已按 {e['delta']:+g} 处理, 请核对")
         if e['name'] is None:
+            tip = ''
+            if e.get('slot_trimmed'):
+                tip = (f"姓名槽里的「{e['slot_trimmed']}」已并回事由"
+                       f"(事由按「{e['reason']}」存档); ")
             warnings.append(f"姓名「{e['name_raw']}」未匹配到{shift or '模板'}名单"
-                            f'(相似度 {e["name_sim"]}), 将只写入明细存档不记分')
+                            f'(相似度 {e["name_sim"]}), 只写入明细存档不记分; '
+                            f'{tip}若他确实在{shift or "该班"}, 请在「名单(报名表)」'
+                            f'页签导入该班报名表(导入后姓名即可匹配)')
     return {
         'path': path,
         'month': res['month'],
@@ -393,7 +455,12 @@ def parse_detail_lines(text, roster=(), month=None):
         if not (1 <= e['day'] <= 31):
             warnings.append(f"第 {i} 行日期 {e['day']} 超出 1~31, 请核对")
         if e['name'] is None:
+            tip = ''
+            if e.get('slot_trimmed'):
+                tip = (f"(姓名槽里的「{e['slot_trimmed']}」已并回事由: "
+                       f"「{e['reason']}」)")
             warnings.append(f"第 {i} 行姓名「{e['name_raw']}」未匹配名单, "
-                            f'只写入明细存档不记分')
+                            f'只写入明细存档不记分{tip}; '
+                            f'若该人在本班, 请在「名单(报名表)」页签导入报名表')
         entries.append(e)
     return entries, warnings

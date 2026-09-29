@@ -9,6 +9,8 @@ _out/
 paofen.log
 paofen_config.json
 selftest_result.txt
+ocr_diag.txt
+deps_probe.txt
 
 # 打包产物
 build/

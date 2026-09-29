@@ -18,6 +18,9 @@
 """
 from PyInstaller.utils.hooks import collect_all
 
+import os
+import sys
+
 datas, binaries, hiddenimports = [], [], []
 for _pkg in ('rapidocr_onnxruntime', 'tkinterdnd2', 'onnxruntime'):
     _d, _b, _h = collect_all(_pkg)
@@ -30,13 +33,22 @@ a = Analysis(
     pathex=[],
     binaries=binaries,
     datas=datas,
-    hiddenimports=hiddenimports + ['numpy', 'cv2', 'openpyxl'],
+    hiddenimports=hiddenimports + ['numpy', 'cv2', 'openpyxl', 'check_exe_compat'],
     hookspath=[],
     runtime_hooks=[],
     excludes=['matplotlib', 'pandas', 'scipy', 'IPython', 'notebook',
               'PyQt5', 'PySide2', 'wx', 'tkinter.test'],
     noarchive=False,
 )
+
+# ---- VC 运行库: 补到「引用了它的子目录」里(见 check_exe_compat 里的说明) ----
+# 目标机(尤其老系统)system32 里的 MSVCP140.dll 可能过旧, 会让子目录里的
+# onnxruntime\capi\*.pyd 报「DLL load failed ... 找不到指定的程序」。
+sys.path.insert(0, globals().get('SPECPATH') or os.getcwd())
+import check_exe_compat as _cc                              # noqa: E402
+
+_cc.add_runtime_beside_binaries(a.binaries)
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

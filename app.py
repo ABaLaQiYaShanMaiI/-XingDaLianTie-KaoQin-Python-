@@ -17,6 +17,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -762,6 +763,21 @@ def _selftest():
     except Exception as e:                                    # noqa: BLE001
         ok = False
         lines.append(f'[X] OCR 引擎初始化失败: {e}')
+    try:                                    # ORT 用的 VC 运行库来自哪里(老系统关键)
+        base = getattr(sys, '_MEIPASS', HERE)
+        capi = os.path.join(base, 'onnxruntime', 'capi')
+        sys32 = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32')
+        for dll in ('MSVCP140.dll', 'VCRUNTIME140.dll', 'VCRUNTIME140_1.dll'):
+            local = os.path.join(capi, dll)
+            if os.path.isfile(local):
+                lines.append(f'[OK] OCR 用包内 {dll}')
+            else:
+                lines.append(f'[warn] 包内没有 {dll}, 将用目标机 '
+                             f'{os.path.join(sys32, dll)}'
+                             f'({"存在" if os.path.isfile(os.path.join(sys32, dll)) else "缺失"})'
+                             ' —— 太旧会导致「找不到指定的程序」')
+    except Exception as e:                                    # noqa: BLE001
+        lines.append(f'[warn] 运行库检查跳过: {e}')
     try:
         t = excel_core.find_template(HERE)
         lines.append(f'[{"OK" if t else "warn"}] 模板: {t or "未找到, 可在界面点「选择…」指定"}')
@@ -821,9 +837,151 @@ def _selftest():
     return 0 if ok else 1
 
 
+def _ocr_diag(path):
+    """--ocr <照片>: 单张照片识别诊断(在对方电脑上排障用)。
+
+    GUI 程序没有控制台, 所以分阶段记录到 exe 同目录的 ocr_diag.txt:
+      1) 环境(版本/系统/目录); 2) 读图; 3) OCR 引擎初始化;
+      4) 模型推理(文本框数量与前几条文本); 5) 完整解析结果 + 异常回溯。
+    哪一步出现 [X]/[!] 就是问题所在(例如引擎初始化失败 = 目标机缺运行库)。
+    """
+    lines = []
+    ok = True
+
+    def log(s):
+        lines.append(s)
+
+    log(f'照片: {path}')
+    log(f'python: {sys.version.split()[0]}  frozen={getattr(sys, "frozen", False)}')
+    log(f'程序目录: {HERE}')
+    try:
+        import platform
+        log(f'系统: {platform.platform()} (ver {platform.version()})')
+    except Exception:                                         # noqa: BLE001
+        pass
+    for mod in ('numpy', 'cv2', 'onnxruntime', 'rapidocr_onnxruntime'):
+        try:
+            m = __import__(mod)
+            log(f'[OK] import {mod} {getattr(m, "__version__", "")}')
+        except Exception as e:                                # noqa: BLE001
+            ok = False
+            log(f'[X] import {mod}: {e!r}')
+    img = None
+    try:
+        t0 = time.time()
+        img = detail_core.imread_cn(path)
+        log(f'[OK] 读图: shape={img.shape} 耗时={time.time() - t0:.2f}s')
+    except Exception as e:                                    # noqa: BLE001
+        ok = False
+        log(f'[X] 读图失败: {e!r}')
+    if img is not None:
+        try:
+            t0 = time.time()
+            engine = detail_core.get_engine()
+            log(f'[OK] OCR 引擎初始化 耗时={time.time() - t0:.2f}s')
+        except Exception:                                     # noqa: BLE001
+            ok = False
+            log('[X] OCR 引擎初始化失败:')
+            log(traceback.format_exc())
+        else:
+            try:
+                t0 = time.time()
+                res, _elapse = engine(img)
+                res = res or []
+                log(f'[{"OK" if res else "X"}] OCR 推理: {len(res)} 个文本框 '
+                    f'耗时={time.time() - t0:.2f}s')
+                for item in res[:10]:
+                    score = item[2] if len(item) > 2 else ''
+                    log(f'      {item[0]!r} {score}')
+            except Exception:                                 # noqa: BLE001
+                ok = False
+                log('[X] OCR 推理异常:')
+                log(traceback.format_exc())
+    try:
+        t0 = time.time()
+        tpl = excel_core.find_template(HERE)
+        rosters = excel_core.load_rosters(tpl) if tpl else {}
+        r = detail_core.parse_photo(path, rosters)
+        log(f'[{"OK" if r["entries"] else "X"}] 解析: 月份={r["month"]} 班次={r["shift"]} '
+            f'条目={len(r["entries"])} 旋转={r["rotate"]} 文本框={r["raw_count"]} '
+            f'耗时={time.time() - t0:.2f}s')
+        for i, e in enumerate(r['entries'], 1):
+            log(f'      {i}. {e}')
+        for w in r['warnings']:
+            log(f'   [!] {w}')
+        ok = ok and bool(r['entries'])
+    except Exception:                                         # noqa: BLE001
+        ok = False
+        log('[X] parse_photo 异常:')
+        log(traceback.format_exc())
+    report = '\n'.join(lines) + f'\n结果: {"正常" if ok else "异常(见上面 [X]/[!] 行)"}'
+    print(report)
+    out = os.path.join(HERE, 'ocr_diag.txt')
+    try:
+        with open(out, 'w', encoding='utf-8') as f:
+            f.write(report + '\n')
+        print('诊断结果已写入: %s' % out)
+    except OSError as e:
+        logger.warning('诊断结果写入失败: %s', e)
+    return 0 if ok else 1
+
+
+def _probe_deps():
+    """--probe: 逐个导入函数体检(在对方电脑上跑, 定位「找不到指定的程序」到底缺谁)。
+
+    结果写 exe 同目录 deps_probe.txt: 包内每个 dll/pyd 引用的函数, 在这台机器上是否
+    真的存在(按加载器顺序: 先看同目录那份, 再按名字找系统); 缺的几条就是根因。
+    """
+    import check_exe_compat
+    base = getattr(sys, '_MEIPASS', HERE)
+    files = []
+    for root, _dirs, names in os.walk(base):
+        for n in names:
+            if n.lower().endswith(('.pyd', '.dll', '.exe')):
+                files.append(os.path.join(root, n))
+    lines = [f'python: {sys.version.split()[0]}  frozen={getattr(sys, "frozen", False)}',
+             f'解包目录: {base} ({len(files)} 个二进制)']
+    capi = os.path.join(base, 'onnxruntime', 'capi')
+    for dll in ('MSVCP140.dll', 'VCRUNTIME140.dll', 'VCRUNTIME140_1.dll'):
+        path = os.path.join(capi, dll)
+        if os.path.isfile(path):
+            lines.append(f'{dll}: 包内 {path} (版本 {check_exe_compat.file_version(path)})')
+        else:
+            lines.append(f'{dll}: 包内没有, 会用系统那份')
+    missing = check_exe_compat.probe_missing_exports(
+        files, extra_dirs=[os.path.join(base, d) for d in os.listdir(base)
+                           if d.endswith('.libs')])
+    if missing:
+        lines.append(f'缺失的导入 {len(missing)} 条:')
+        for path, dll, func, resolved in missing:
+            lines.append('   [X] %s 需要 %s!%s (实际加载: %s)' % (
+                os.path.relpath(path, base), dll, func, resolved))
+    else:
+        lines.append('[OK] 包内二进制引用的函数在这台机器上全部存在')
+    report = '\n'.join(lines)
+    print(report)
+    out = os.path.join(HERE, 'deps_probe.txt')
+    try:
+        with open(out, 'w', encoding='utf-8') as f:
+            f.write(report + '\n')
+        print('体检结果已写入: %s' % out)
+    except OSError as e:
+        logger.warning('体检结果写入失败: %s', e)
+    return 1 if missing else 0
+
+
 def main():
     if '--selftest' in sys.argv:
         return _selftest()
+    if '--probe' in sys.argv:                # 导入函数体检(定位「找不到指定的程序」)
+        return _probe_deps()
+    if '--ocr' in sys.argv:                  # 单张照片识别诊断(排障用)
+        rest = [a for a in sys.argv[sys.argv.index('--ocr') + 1:]
+                if not a.startswith('-')]
+        if not rest:
+            print('用法: 跑分绩效汇总自动生成工具.exe --ocr <照片路径>')
+            return 2
+        return _ocr_diag(rest[0])
     root = TkinterDnD.Tk() if TkinterDnD else tk.Tk()
     PaofenApp(root)
     root.mainloop()

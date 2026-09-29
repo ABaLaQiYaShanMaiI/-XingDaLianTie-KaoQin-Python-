@@ -1,0 +1,20 @@
+# -*- coding: utf-8 -*-
+# Windows 7 兼容版依赖 —— 必须配 Python 3.8 使用(官方最后一个支持 Win7 的版本)
+#
+# 选版依据(每个包都用 check_exe_compat.py 核对了包内二进制的导入表):
+#   * Python 3.9+ 的运行时 python3x.dll 引用 api-ms-win-core-path-l1-1-0.dll,
+#     Windows 7 没有这个 API 集(要单独打 KB2533623), 装完也未必能用 —— 故用 3.8;
+#   * onnxruntime 1.15+ 起 onnxruntime_pybind11_state.pyd 也引用上面那个 API 集
+#     (实测 1.11.1 / 1.13.1 / 1.14.1 干净, 1.15.1 起不干净) —— 必须停在 1.14.1;
+#   * numpy 1.24.4 是最后一个提供 cp38 wheel 的版本(1.25+ 不再支持 3.8), 且干净;
+#   * opencv-python 4.10.0.84 是 cp37-abi3 wheel, 兼容 3.8, 且不引用 Win8+ API 集;
+#   * 其余为纯 Python 包, 与系统版本无关。
+#
+# 安装(用 3.8 的 python):
+#   "%LOCALAPPDATA%\Programs\Python\Python38\python.exe" -m pip install -r requirements-win7.txt
+openpyxl==3.1.5
+numpy==1.24.4
+opencv-python==4.10.0.84
+onnxruntime==1.14.1
+rapidocr-onnxruntime==1.2.3
+tkinterdnd2==0.6.2
