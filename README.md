@@ -74,6 +74,7 @@ python app.py        # 启动图形界面
 
 ```bash
 python _test_pipeline.py   # 核心端到端: 手写照片->OCR->填表->逐格校验
+python _test_handwriting.py # 手写体准确率: 15 条标准答案 x 正拍/横拍/倒拍/拍虚/换名单
 python _test_printed.py    # 打印体端到端: 渲染两种打印版式(合并式/分列式)->OCR->填表->逐格校验
 python _test_roster.py     # 报名表端到端: 名单变动(18/20/15人)+文字明细->名单重排/公式/日格校验
 python _test_gui.py        # GUI 全流程: 建界面->照片识别->名单导入->文字明细->两种场景生成
