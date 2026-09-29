@@ -37,8 +37,12 @@ DATE_RE = re.compile(
     r'^(?:(?P<month>\d{1,2})[.．,，、月](?P<day>\d{1,2})|(?P<day_only>\d{1,2}))[日号]?(?P<rest>.*)$')
 # 姓名槽: 紧跟日期的 2~4 个汉字(可能吞入事由首字, 由 match_name 前缀收敛)
 NAME_RE = re.compile(r'^[\u4e00-\u9fa5]{2,4}')
-# 行尾分值: 「+3」/「-5」/「3」/「3分」
-SCORE_RE = re.compile(r'(?P<sign>[+\-]?)\s*(?P<num>\d+(?:\.\d+)?)\s*分?$')
+# 行尾分值: 「+3」/「-5」/「3」/「3分」; 兼容 OCR 把符号读到数字右侧(「3-」按 -3 处理)
+SCORE_RE = re.compile(
+    r'(?:(?P<pre>[+\-])\s*)?(?P<num>\d+(?:\.\d+)?)\s*分?\s*(?P<post>[+\-])?$')
+# 打印体表格行内噪声: 最左侧「序号」列碎片(纯 1~3 位数字) 与 日期碎片开头
+SEQ_NO_RE = re.compile(r'^\d{1,3}$')
+DATE_HEAD_RE = re.compile(r'^\d{1,2}[.．,，、月]\d{1,2}')
 
 # 全角/标点归一化
 _NORMAL_TABLE = str.maketrans({
@@ -145,8 +149,9 @@ def parse_entry(text, roster):
     sm = SCORE_RE.search(tail)
     if not sm:
         return None
+    sign = sm.group('pre') or sm.group('post') or ''
     delta = float(sm.group('num'))
-    if sm.group('sign') == '-':
+    if sign == '-':
         delta = -delta
     entry = {
         'month': month,
@@ -155,6 +160,8 @@ def parse_entry(text, roster):
         'name': None,
         'name_sim': 0.0,
         'reason': tail[:sm.start()],
+        'score_raw': normalize(sm.group(0)),
+        'score_post': bool(sm.group('post') and not sm.group('pre')),
         'delta': int(delta) if float(delta).is_integer() else delta,
     }
     return _apply_roster(entry, roster)
@@ -163,6 +170,17 @@ def parse_entry(text, roster):
 def _entry_key(e):
     return (e.get('day'), e.get('name_raw'), e.get('delta'))
 
+
+def _drop_seq_no(row):
+    """去掉打印体表格行最左侧的「序号」列碎片(纯数字且右侧紧跟日期碎片)。
+
+    分列式打印表格中, OCR 可能把「序号」列单独识别成一个框(如「10」「11」),
+    按行拼接时会与日期粘连成「107.19…」导致整行解析失败。
+    """
+    if len(row) >= 2 and SEQ_NO_RE.match(normalize(row[0]['text'])) \
+            and DATE_HEAD_RE.match(normalize(row[1]['text'])):
+        return row[1:]
+    return row
 
 
 def _parse_orientation(engine, img, roster):
@@ -215,8 +233,14 @@ def _parse_orientation(engine, img, roster):
         if any(abs(row[0]['yc'] - e['_yc']) <= tol for e in entries):
             continue  # 该行主体已按整框解析过
         row.sort(key=lambda it: it['xc'])
-        joined = ''.join(it['text'] for it in row)
+        joined = ''.join(it['text'] for it in _drop_seq_no(row))
         e = parse_entry(joined, roster)
+        if e is None:
+            # OCR 把「序号」与日期并成一框(如「107.19…」)时, 去掉行首多余数字重试
+            stripped = re.sub(r'^\d{1,3}(?=\d{1,2}[.．,，、月]\d{1,2})', '',
+                              normalize(joined))
+            if stripped != normalize(joined):
+                e = parse_entry(stripped, roster)
         if e is not None:
             e['conf'] = round(min(it['conf'] for it in row), 2)
             e['_yc'] = sum(it['yc'] for it in row) / len(row)
@@ -277,6 +301,9 @@ def parse_photo(path, rosters, shift_override=None):
                 f"条目 {e['month']}.{e['day']} 月份与标题({res['month']}月)不一致, 请核对")
         if not (1 <= e['day'] <= 31):
             warnings.append(f"条目日期 {e['day']} 超出 1~31, 请人工核对")
+        if e.get('score_post'):
+            warnings.append(f"分值「{e.get('score_raw')}」符号在数字右侧(识别倒序), "
+                            f"已按 {e['delta']:+g} 处理, 请核对")
         if e['name'] is None:
             warnings.append(f"姓名「{e['name_raw']}」未匹配到{shift or '模板'}名单"
                             f'(相似度 {e["name_sim"]}), 将只写入明细存档不记分')
@@ -328,3 +355,45 @@ def detail_text(entry, month=None):
         d = int(d)
     score = ('+' if d >= 0 else '') + str(d)
     return f'{m}.{entry["day"]}{name}{entry.get("reason") or ""}{score}'
+
+
+# 手工录入/粘贴明细时的行首序号: 「1、」「1.」「1)」等
+SEQ_PREFIX_RE = re.compile(r'^\s*\d{1,3}\s*[、.,，:：)）]\s*')
+
+
+def parse_detail_lines(text, roster=(), month=None):
+    """解析手工录入/粘贴的明细文本(一行一条), 返回 (entries, warnings)。
+
+    兼容带序号(「1、7.2叶么菊发现现场安全隐患+3」)与不带序号
+    (「7.2叶么菊发现现场安全隐患+3」)两种写法; 行首序号只在
+    「去掉后仍以日期开头」时才剥离(避免把「7.2」的月份一起吃掉)。
+    """
+    entries, warnings = [], []
+    for i, line in enumerate(str(text).splitlines(), 1):
+        raw = line.strip()
+        if not raw:
+            continue
+        cands = [raw]
+        m = SEQ_PREFIX_RE.match(raw)
+        if m:
+            cands.insert(0, raw[m.end():])
+        e = None
+        for cand in cands:
+            t = normalize(cand)
+            if not DATE_HEAD_RE.match(t):
+                continue
+            e = parse_entry(t, roster)
+            if e is not None:
+                break
+        if e is None:
+            warnings.append(f'第 {i} 行无法解析, 已忽略: {raw}')
+            continue
+        if month is not None and e['month'] is not None and e['month'] != month:
+            warnings.append(f"第 {i} 行月份 {e['month']} 与所填月份({month})不一致, 请核对")
+        if not (1 <= e['day'] <= 31):
+            warnings.append(f"第 {i} 行日期 {e['day']} 超出 1~31, 请核对")
+        if e['name'] is None:
+            warnings.append(f"第 {i} 行姓名「{e['name_raw']}」未匹配名单, "
+                            f'只写入明细存档不记分')
+        entries.append(e)
+    return entries, warnings

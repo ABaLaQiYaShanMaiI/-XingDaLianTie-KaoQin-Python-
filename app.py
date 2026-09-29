@@ -31,6 +31,8 @@ except ImportError:  # 未装 tkinterdnd2 时退化为普通 tkinter(无拖拽)
     TkinterDnD = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):      # PyInstaller 单文件运行时, 以 exe 所在目录为准
+    HERE = os.path.dirname(os.path.abspath(sys.executable))
 CONFIG_PATH = os.path.join(HERE, 'paofen_config.json')
 LOG_PATH = os.path.join(HERE, 'paofen.log')
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
@@ -44,10 +46,42 @@ logging.getLogger('rapidocr_onnxruntime').setLevel(logging.WARNING)
 
 DEFAULT_CONFIG = {
     'template': '',
-    'out_dir': HERE,
+    'out_dir': '',          # 空=用默认(桌面); 记录上次选择
     'pool_amount': '',
     'base_score': excel_core.BASE_SCORE_DEFAULT,
+    'rosters': {},          # {'甲班': '报名表.xlsx', ...} 上次选择的名单(默认记忆)
 }
+
+
+def _desktop_candidates():
+    """桌面目录候选(Windows 优先读注册表, 兼容 OneDrive 重定向的桌面)。"""
+    cands = []
+    try:                                        # 1) 用户 Shell 文件夹(含重定向)
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r'Software\Microsoft\Windows\CurrentVersion'
+                r'\Explorer\User Shell Folders') as key:
+            cands.append(os.path.expandvars(str(winreg.QueryValueEx(key, 'Desktop')[0])))
+    except (ImportError, OSError, ValueError):
+        pass
+    try:                                        # 2) Windows API(CSIDL_DESKTOPDIRECTORY)
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf) == 0:
+            cands.append(buf.value)
+    except (ImportError, AttributeError, OSError):
+        pass
+    cands.append(os.path.join(os.path.expanduser('~'), 'Desktop'))   # 3) 兜底
+    return cands
+
+
+def default_out_dir():
+    """默认输出目录: 桌面(取不到时退回程序目录)。"""
+    for p in _desktop_candidates():
+        if p and os.path.isdir(p):
+            return p
+    return HERE
 
 
 def load_config():
@@ -72,11 +106,15 @@ class PaofenApp:
     def __init__(self, root):
         self.root = root
         root.title('跑分绩效汇总自动生成工具')
-        root.geometry('1000x760')
-        root.minsize(860, 640)
+        root.geometry('1060x860')
+        root.minsize(900, 640)
         self.cfg = load_config()
         self.photos = []      # [{'path': str, 'override': ''|'甲班'...}]
         self.results = {}     # path -> parse_photo 结果
+        self.roster_files = {k: v for k, v in (self.cfg.get('rosters') or {}).items() if v}
+        self.manual_text = {}         # {班次: 手工录入的明细文本}
+        self.manual_results = []      # [parse 结果(dict), ...] 与照片结果同构
+        self._tpl_rosters = None      # 模板内名单缓存(显示人数用)
         self.q = queue.Queue()
         self.busy = False
         self.out_path = None
@@ -102,6 +140,9 @@ class PaofenApp:
             row=1, column=1, sticky='we', **pad)
         ttk.Button(top, text='选择…', width=8,
                    command=self._pick_outdir).grid(row=1, column=2, **pad)
+        ttk.Button(top, text='输出到桌面', width=10,
+                   command=self._use_desktop_out).grid(row=1, column=5,
+                                                       columnspan=2, sticky='w', **pad)
         ttk.Label(top, text='月份(空=自动):').grid(row=0, column=3, sticky='e', **pad)
         self.var_month = tk.StringVar()
         ttk.Entry(top, textvariable=self.var_month, width=8).grid(row=0, column=4, **pad)
@@ -113,11 +154,49 @@ class PaofenApp:
         ttk.Entry(top, textvariable=self.var_pool, width=12).grid(row=0, column=6, **pad)
         top.columnconfigure(1, weight=1)
 
+        # ---- 名单(报名表) / 手工录入明细 ----
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill='x', **pad)
+
+        tab_r = ttk.Frame(nb)                      # 名单(报名表)
+        nb.add(tab_r, text=' 名单(报名表) ')
+        cols = ('shift', 'source', 'count', 'status')
+        self.tv_roster = ttk.Treeview(tab_r, columns=cols, show='headings', height=4)
+        for c, w, t in (('shift', 50, '班次'), ('source', 200, '名单来源'),
+                        ('count', 50, '人数'), ('status', 290, '说明')):
+            self.tv_roster.heading(c, text=t)
+            self.tv_roster.column(c, width=w, anchor='w')
+        self.tv_roster.pack(side='left', fill='both', expand=True, padx=(6, 0), pady=6)
+        rb = ttk.Frame(tab_r)
+        rb.pack(side='left', fill='y', padx=6, pady=6)
+        ttk.Button(rb, text='导入名单…', command=self._pick_roster).pack(fill='x', pady=2)
+        ttk.Button(rb, text='用模板名单', command=self._use_template_roster
+                   ).pack(fill='x', pady=2)
+        ttk.Label(tab_r, foreground='#666', justify='left', text=(
+            '选中一行后点左侧按钮;\n导入即生效并记忆为默认;\n考勤表人名按报名表重排')).pack(
+                side='left', padx=6)
+
+        tab_m = ttk.Frame(nb)                      # 手工录入/粘贴明细
+        nb.add(tab_m, text=' 手工录入/粘贴明细 ')
+        mr = ttk.Frame(tab_m)
+        mr.pack(fill='x', padx=6, pady=(6, 0))
+        ttk.Label(mr, text='班次:').pack(side='left')
+        self.var_manual_shift = tk.StringVar(value=detail_core.SHIFT_NAMES[0])
+        ttk.Combobox(mr, textvariable=self.var_manual_shift, width=6, state='readonly',
+                     values=detail_core.SHIFT_NAMES).pack(side='left', padx=4)
+        ttk.Button(mr, text='解析文本明细', command=self._parse_manual_text
+                   ).pack(side='left', padx=4)
+        ttk.Label(mr, foreground='#666', text=(
+            '一行一条, 如「1、7.2叶么菊发现现场安全隐患+3」; 序号可有可无, '
+            '可与照片混用')).pack(side='left', padx=6)
+        self.txt_manual = tk.Text(tab_m, height=5, wrap='none')
+        self.txt_manual.pack(fill='both', expand=True, padx=6, pady=6)
+
         # ---- 中部: 明细照片 ----
         mid = ttk.LabelFrame(self.root, text=' 考核明细照片(每班一张, 可拖入) ')
         mid.pack(fill='both', expand=True, **pad)
         cols = ('file', 'shift', 'count', 'status')
-        self.tv_photos = ttk.Treeview(mid, columns=cols, show='headings', height=5)
+        self.tv_photos = ttk.Treeview(mid, columns=cols, show='headings', height=4)
         for c, w, t in (('file', 380, '照片文件'), ('shift', 90, '班次'),
                         ('count', 70, '条目数'), ('status', 300, '状态')):
             self.tv_photos.heading(c, text=t)
@@ -148,7 +227,7 @@ class PaofenApp:
         prev = ttk.LabelFrame(self.root, text=' 识别结果预览(可人工核对) ')
         prev.pack(fill='both', expand=True, **pad)
         cols = ('photo', 'shift', 'seq', 'date', 'name', 'match', 'reason', 'score')
-        self.tv_entries = ttk.Treeview(prev, columns=cols, show='headings', height=9)
+        self.tv_entries = ttk.Treeview(prev, columns=cols, show='headings', height=6)
         for c, w, t in (('photo', 70, '照片'), ('shift', 50, '班次'),
                         ('seq', 40, '序号'), ('date', 55, '日期'),
                         ('name', 90, '姓名(识别)'), ('match', 90, '匹配名单'),
@@ -156,7 +235,7 @@ class PaofenApp:
             self.tv_entries.heading(c, text=t)
             self.tv_entries.column(c, width=w, anchor='w')
         self.tv_entries.pack(fill='both', expand=True, padx=6, pady=(6, 2))
-        self.txt_warn = tk.Text(prev, height=5, wrap='word', fg='#a33')
+        self.txt_warn = tk.Text(prev, height=4, wrap='word', fg='#a33')
         self.txt_warn.pack(fill='x', padx=6, pady=(0, 6))
         self.txt_warn.insert('1.0', '警告/提示会显示在这里')
         self.txt_warn.config(state='disabled')
@@ -185,9 +264,16 @@ class PaofenApp:
             t = excel_core.find_template(HERE)
             if t:
                 self.var_template.set(t)
-        self.var_out.set(self.cfg.get('out_dir') or HERE)
+        saved_out = str(self.cfg.get('out_dir') or '').strip()
+        if saved_out and os.path.isdir(saved_out):
+            self.var_out.set(saved_out)          # 记忆上次选择
+        else:
+            if saved_out:                        # 换机器/目录被删 -> 回到默认
+                logger.warning('输出目录不存在, 已改用默认目录: %s', saved_out)
+            self.var_out.set(default_out_dir())
         self.var_pool.set(str(self.cfg.get('pool_amount') or ''))
         self.var_base.set(str(self.cfg.get('base_score') or excel_core.BASE_SCORE_DEFAULT))
+        self._refresh_roster_tree()      # 上次选择的报名表(默认)带出来
 
     def _persist_config(self):
         self.cfg.update({
@@ -195,6 +281,7 @@ class PaofenApp:
             'out_dir': self.var_out.get().strip(),
             'pool_amount': self.var_pool.get().strip(),
             'base_score': self.var_base.get().strip(),
+            'rosters': {k: v for k, v in (self.roster_files or {}).items() if v},
         })
         save_config(self.cfg)
 
@@ -203,13 +290,158 @@ class PaofenApp:
                                        filetypes=[('Excel 模板', '*.xlsx')])
         if p:
             self.var_template.set(p)
+            self._tpl_rosters = None
             self._persist_config()
+            self._refresh_roster_tree()
 
     def _pick_outdir(self):
         p = filedialog.askdirectory(title='选择输出目录')
         if p:
             self.var_out.set(p)
             self._persist_config()
+
+    def _use_desktop_out(self):
+        d = default_out_dir()
+        self.var_out.set(d)
+        self._persist_config()
+        self._set_status(f'输出目录已设为桌面: {d}')
+
+    # ---------------- 名单(报名表) / 手工录入明细 ----------------
+    def _tpl_roster_map(self):
+        """模板内名单(按模板路径缓存) -> {班次: [姓名]}。"""
+        template = self.var_template.get().strip()
+        if self._tpl_rosters is None or getattr(self, '_tpl_path', None) != template:
+            try:
+                self._tpl_rosters = (excel_core.load_rosters(template)
+                                     if os.path.isfile(template) else {})
+            except Exception as e:
+                logger.warning('读取模板名单失败: %s', e)
+                self._tpl_rosters = {}
+            self._tpl_path = template
+        return self._tpl_rosters
+
+    def _effective_rosters(self):
+        """生效名单(报名表覆盖模板名单)。
+
+        返回 (rosters, override, notes):
+          rosters  {班次: [姓名]} —— 姓名匹配用
+          override {班次: [姓名]} —— 需按报名表重排考勤表名单的班次
+          notes    [str]          —— 预览区提示
+        """
+        rosters = dict(self._tpl_roster_map())
+        override, notes = {}, []
+        for shift, path in sorted((self.roster_files or {}).items()):
+            if not path:
+                continue
+            if not os.path.isfile(path):
+                notes.append(f'{shift} 报名表不存在({path}), 已改用模板内名单')
+                continue
+            try:
+                names, sheet = excel_core.load_roster_file(path, shift)
+            except Exception as e:
+                notes.append(f'{shift} 报名表读取失败({e}), 已改用模板内名单')
+                continue
+            if not names:
+                notes.append(f'{shift} 报名表「{os.path.basename(path)}」未读到姓名, '
+                             f'已改用模板内名单')
+                continue
+            rosters[shift] = names
+            override[shift] = names
+            notes.append(f'{shift} 按报名表「{os.path.basename(path)}[{sheet}]」'
+                         f'{len(names)} 人(生成时重排考勤表名单)')
+        return rosters, override, notes
+
+    def _pick_roster(self):
+        sel = self.tv_roster.selection()
+        if not sel:
+            self._set_status('请先在名单列表里选中一个班次')
+            return
+        shift = self.tv_roster.item(sel[0], 'values')[0]
+        p = filedialog.askopenfilename(
+            title=f'选择{shift}报名表/名单',
+            filetypes=[('Excel 名单', '*.xlsx *.xlsm')])
+        if not p:
+            return
+        try:
+            names, sheet = excel_core.load_roster_file(p, shift)
+        except Exception as e:
+            messagebox.showerror('错误', f'读取名单失败:\n{e}')
+            return
+        if not names:
+            messagebox.showwarning('提示', f'未从该文件中读到姓名:\n{p}')
+            return
+        self.roster_files[shift] = p
+        self._persist_config()          # 选择即记忆为默认(下次启动沿用)
+        self._refresh_roster_tree()
+        self._invalidate_results()
+        self._set_status(f'{shift} 已导入名单「{sheet}」{len(names)} 人, 已记忆为默认')
+
+    def _use_template_roster(self):
+        sel = self.tv_roster.selection()
+        if not sel:
+            self._set_status('请先在名单列表里选中一个班次')
+            return
+        shift = self.tv_roster.item(sel[0], 'values')[0]
+        self.roster_files.pop(shift, None)
+        self._persist_config()
+        self._refresh_roster_tree()
+        self._invalidate_results()
+        self._set_status(f'{shift} 已恢复使用模板内名单')
+
+    def _invalidate_results(self):
+        """名单变化后已识别结果作废(生成时会自动补识别)。"""
+        self.results.clear()
+        self._refresh_photo_tree()
+        self._refresh_preview()
+
+    def _refresh_roster_tree(self):
+        self.tv_roster.delete(*self.tv_roster.get_children())
+        tpl = self._tpl_roster_map()
+        for shift in detail_core.SHIFT_NAMES:
+            path = (self.roster_files or {}).get(shift) or ''
+            if path and os.path.isfile(path):
+                try:
+                    names, sheet = excel_core.load_roster_file(path, shift)
+                except Exception as e:
+                    self.tv_roster.insert('', 'end', values=(
+                        shift, os.path.basename(path), '', f'读取失败: {e}'))
+                    continue
+                self.tv_roster.insert('', 'end', values=(
+                    shift, os.path.basename(path), len(names),
+                    f'工作表「{sheet}」, 生成时按此名单重排考勤表'))
+            elif path:
+                self.tv_roster.insert('', 'end', values=(
+                    shift, os.path.basename(path), '', '文件不存在, 已改用模板内名单'))
+            else:
+                self.tv_roster.insert('', 'end', values=(
+                    shift, '模板内名单', len(tpl.get(shift, [])), '默认'))
+
+    def _parse_manual_text(self):
+        shift = self.var_manual_shift.get()
+        text = self.txt_manual.get('1.0', 'end').strip()
+        if not text:
+            self._set_status('请先在文本框里粘贴/输入明细(一行一条)')
+            return
+        rosters, _ov, _notes = self._effective_rosters()
+        month_txt = self.var_month.get().strip()
+        try:
+            month = int(month_txt) if month_txt else None
+        except ValueError:
+            month = None
+        entries, warns = detail_core.parse_detail_lines(
+            text, tuple(rosters.get(shift, ())), month=month)
+        if not entries:
+            messagebox.showwarning('提示', '未解析到任何明细行, 请检查格式')
+            return
+        self.manual_text[shift] = text
+        self.manual_results = [r for r in self.manual_results if r['shift'] != shift]
+        self.manual_results.append({
+            'path': f'(手工录入·{shift})', 'month': month, 'shift': shift,
+            'entries': entries, 'warnings': list(warns), 'rotate': 0,
+            'raw_count': len(entries)})
+        self._refresh_preview()
+        self._set_status(f'{shift} 手工明细 {len(entries)} 条已加入预览'
+                         f'(警告 {len(warns)} 条)')
 
     # ---------------- 照片管理 ----------------
     def _pick_photos(self):
@@ -289,7 +521,8 @@ class PaofenApp:
 
     def _identify_worker(self):
         try:
-            rosters = excel_core.load_rosters(self.var_template.get().strip())
+            rosters, _ov, notes = self._effective_rosters()
+            self.q.put(('status', '; '.join(notes) if notes else '使用模板内名单'))
             for i, ph in enumerate(self.photos):
                 path, ov = ph['path'], ph['override']
                 self.q.put(('status', f'正在识别({i + 1}/{len(self.photos)}): '
@@ -317,8 +550,9 @@ class PaofenApp:
         if not os.path.isfile(template):
             messagebox.showerror('错误', f'模板文件不存在:\n{template}')
             return
-        if not self.photos:
-            messagebox.showinfo('提示', '请先添加考核明细照片')
+        if not self.photos and not self.manual_results:
+            messagebox.showinfo('提示', '请先添加考核明细照片,\n'
+                                        '或在「手工录入/粘贴明细」中录入明细')
             return
         self._persist_config()
         try:
@@ -339,14 +573,19 @@ class PaofenApp:
             messagebox.showerror('错误', '月份必须是整数, 如 7')
             return
         missing = [ph['path'] for ph in self.photos if ph['path'] not in self.results]
+        rosters, override, notes = self._effective_rosters()
+        if notes:
+            self._show_warnings(notes + ['(以上为本次生效的名单来源)'])
         self._set_busy(True, total=len(self.photos) + 1)
         threading.Thread(target=self._generate_worker,
-                         args=(template, missing, base, pool, month),
+                         args=(template, missing, base, pool, month, rosters, override),
                          daemon=True).start()
 
-    def _generate_worker(self, template, missing, base, pool, month):
+    def _generate_worker(self, template, missing, base, pool, month,
+                         rosters=None, roster_override=None):
         try:
-            rosters = excel_core.load_rosters(template)
+            if rosters is None:                     # 兼容直接调用(测试)的情况
+                rosters = excel_core.load_rosters(template)
             for i, path in enumerate(missing):
                 ph = next(p for p in self.photos if p['path'] == path)
                 self.q.put(('status', f'正在识别未识别照片({i + 1}/{len(missing)})…'))
@@ -355,11 +594,12 @@ class PaofenApp:
                 self.results[path] = res
                 self.q.put(('photo_done', path))
             self.q.put(('status', '正在生成 Excel…'))
-            merged = detail_core.merge_results(
-                [self.results[ph['path']] for ph in self.photos], default_month=month)
+            all_results = [self.results[ph['path']] for ph in self.photos] + \
+                list(self.manual_results)
+            merged = detail_core.merge_results(all_results, default_month=month)
             m = month or merged['month']
             if not m:
-                self.q.put(('fatal', '未能确定月份: 照片标题未识别到「X月」'
+                self.q.put(('fatal', '未能确定月份: 明细标题未识别到「X月」'
                                     '且未在界面填写月份, 请手动填写后重试'))
                 return
             out_dir = self.var_out.get().strip() or HERE
@@ -367,7 +607,8 @@ class PaofenApp:
             out_path = excel_core.build_output_path(out_dir, m)
             report = excel_core.fill_from_details(
                 template, out_path, merged['shift_entries'], month=m,
-                base_score=base, pool_amount=pool)
+                base_score=base, pool_amount=pool,
+                roster_override=roster_override)
             self.q.put(('generate_done', (out_path, m, merged, report)))
         except Exception:
             logger.exception('生成失败')
@@ -445,6 +686,17 @@ class PaofenApp:
                     f"{e['delta']:+g}"))
             for w in res['warnings']:
                 all_warns.append(f"[{os.path.basename(ph['path'])}] {w}")
+        for res in self.manual_results:          # 手工录入/粘贴的明细
+            shift = res['shift'] or '未知'
+            for seq, e in enumerate(res['entries'], 1):
+                self.tv_entries.insert('', 'end', values=(
+                    res['path'], shift, seq, f"{e['month'] or res['month']}.{e['day']}",
+                    e['name_raw'], e['name'] or '未匹配', e['reason'],
+                    f"{e['delta']:+g}"))
+            for w in res['warnings']:
+                all_warns.append(f"[{res['path']}] {w}")
+        if not self.photos and not self.manual_results:
+            all_warns.extend(self._effective_rosters()[2])
         self._show_warnings(all_warns)
 
     def _show_warnings(self, warns):
@@ -481,12 +733,103 @@ class PaofenApp:
                 os.startfile(folder)
 
 
+def _selftest():
+    """--selftest: 环境/打包自检(依赖导入、OCR 模型、模板定位、明细解析)。
+
+    结果同时打印到控制台并写入 exe 同目录的 selftest_result.txt, 便于打包后核对。
+    """
+    lines = []
+    ok = True
+    lines.append(f'python: {sys.version.split()[0]}  frozen={getattr(sys, "frozen", False)}')
+    lines.append(f'程序目录: {HERE}')
+    for mod in ('numpy', 'cv2', 'openpyxl', 'onnxruntime', 'rapidocr_onnxruntime'):
+        try:
+            m = __import__(mod)
+            lines.append(f'[OK] import {mod} {getattr(m, "__version__", "")}')
+        except Exception as e:                                # noqa: BLE001
+            ok = False
+            lines.append(f'[X] import {mod}: {e}')
+    try:
+        import tkinterdnd2
+        lines.append(f'[OK] import tkinterdnd2 (支持拖拽)')
+    except Exception as e:                                    # noqa: BLE001
+        lines.append(f'[warn] tkinterdnd2 不可用(退化为无拖拽窗口): {e}')
+    try:
+        import numpy as _np
+        engine = detail_core.get_engine()
+        res, _ = engine(_np.full((64, 256, 3), 255, dtype=_np.uint8))
+        lines.append(f'[OK] OCR 引擎可用(空图返回 {len(res or [])} 个文本框)')
+    except Exception as e:                                    # noqa: BLE001
+        ok = False
+        lines.append(f'[X] OCR 引擎初始化失败: {e}')
+    try:
+        t = excel_core.find_template(HERE)
+        lines.append(f'[{"OK" if t else "warn"}] 模板: {t or "未找到, 可在界面点「选择…」指定"}')
+    except Exception as e:                                    # noqa: BLE001
+        ok = False
+        lines.append(f'[X] 模板定位失败: {e}')
+    d = default_out_dir()
+    lines.append(f'[{"OK" if os.path.isdir(d) else "warn"}] 默认输出目录(桌面): {d}')
+    if t:                                     # 完整链路自检: 明细 -> 填表 -> 读回校验
+        tmp = None
+        try:
+            import tempfile
+
+            import openpyxl
+            roster = tuple(excel_core.load_rosters(t).get('甲班', ()))
+            e2, _w = detail_core.parse_detail_lines(
+                '7.2叶么菊发现现场安全隐患+3', roster)
+            tmp = os.path.join(tempfile.gettempdir(), '_paofen_selftest.xlsx')
+            excel_core.fill_from_details(t, tmp, {'甲班': e2},
+                                         write_detail_sheet=False)
+            wb = openpyxl.load_workbook(tmp)
+            try:
+                ws = wb['甲班']
+                row = next(r for r in range(excel_core.DATA_FIRST_ROW, 60)
+                           if str(ws.cell(row=r, column=2).value or '').strip() == '叶么菊')
+                got = ws.cell(row=row, column=4).value          # 2日 -> D列
+                formula = ws.cell(row=row, column=34).value
+            finally:
+                wb.close()
+            good = got == 3 and formula == f'=80+SUM(C{row}:AG{row})'
+            ok = ok and good
+            lines.append(f'[{"OK" if good else "X"}] 填表自检: 叶么菊 2日格={got}, '
+                         f'合计公式={formula}')
+        except Exception as e:                                # noqa: BLE001
+            ok = False
+            lines.append(f'[X] 填表自检失败: {e}')
+        finally:
+            if tmp and os.path.isfile(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    entries, warns = detail_core.parse_detail_lines(
+        '1、7.2叶么菊发现现场安全隐患+3', ('叶么菊',))
+    good = len(entries) == 1 and entries[0]['name'] == '叶么菊' and entries[0]['delta'] == 3
+    ok = ok and good
+    lines.append(f'[{"OK" if good else "X"}] 明细解析自检: '
+                 f'{entries[0] if entries else warns}')
+    report = '\n'.join(lines) + f'\n结果: {"通过" if ok else "失败"}'
+    print(report)
+    try:
+        with open(os.path.join(HERE, 'selftest_result.txt'), 'w',
+                  encoding='utf-8') as f:
+            f.write(report + '\n')
+    except OSError as e:
+        logger.warning('自检结果写入失败: %s', e)
+    return 0 if ok else 1
+
+
 def main():
+    if '--selftest' in sys.argv:
+        return _selftest()
     root = TkinterDnD.Tk() if TkinterDnD else tk.Tk()
     PaofenApp(root)
     root.mainloop()
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
 

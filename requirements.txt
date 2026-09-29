@@ -5,3 +5,4 @@ rapidocr-onnxruntime==1.2.3
 opencv-python==5.0.0.93
 numpy==2.5.1
 tkinterdnd2==0.6.2
+pillow==12.3.0          # 仅 _test_printed.py 渲染打印体样例图用
